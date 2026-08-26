@@ -1,0 +1,29 @@
+{
+  "video_id": "LNm3CejENH8",
+  "generated_at": "2026-08-26T15:56:51.687509",
+  "transcript": {
+    "characters": 153388,
+    "words": 21098
+  },
+  "chunking": {
+    "chunk_count": 162,
+    "chunk_size": 1200,
+    "chunk_overlap": 200,
+    "average_chunk_characters": 1062.9,
+    "average_chunk_words": 147.23,
+    "smallest_chunk_characters": 168,
+    "largest_chunk_characters": 1199
+  },
+  "embeddings": {
+    "model": "sentence-transformers/all-MiniLM-L6-v2",
+    "count": 162,
+    "dimension": 384,
+    "dtype": "float32"
+  },
+  "retrieval": {
+    "top_k": 6
+  },
+  "gemini": {
+    "model": "gemini-3.6-flash"
+  }
+}

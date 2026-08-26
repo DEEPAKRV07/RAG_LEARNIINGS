@@ -1,10 +1,13 @@
+import json
 import logging
 import os
 import re
 import traceback
 from datetime import datetime
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+import numpy as np
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -16,12 +19,13 @@ from youtube_transcript_api._errors import (
     VideoUnavailable,
 )
 
-from langchain.chains import RetrievalQA
-from langchain.text_splitter import CharacterTextSplitter
 from langchain_community.document_loaders import TextLoader
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain_groq import ChatGroq
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+from google import genai
+from google.genai import types
 
 
 # =========================================================
@@ -29,29 +33,46 @@ from langchain_groq import ChatGroq
 # =========================================================
 
 st.set_page_config(
-    page_title="YouTube Transcript Retriever - Groq RAG",
+    page_title="YouTube RAG Chatbot",
     page_icon="🎥",
     layout="wide",
 )
 
 
 # =========================================================
-# LOGGING SETUP
+# CONFIGURATION
 # =========================================================
 
 LOG_FILE = "youtube_chatbot.log"
 
+TRANSCRIPT_FILENAME = "transcript.txt"
+CHUNKS_FILENAME = "chunks.json"
+EMBEDDINGS_FILENAME = "embeddings.npy"
+METADATA_FILENAME = "metadata.json"
+TOKEN_USAGE_FILENAME = "token_usage.json"
+PROCESSING_LOG_FILENAME = "processing.log"
+
+# Current Gemini model being used by your working app.
+GEMINI_MODEL = "gemini-3.6-flash"
+
+# Local embedding model.
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
+# RAG configuration.
+CHUNK_SIZE = 1200
+CHUNK_OVERLAP = 200
+TOP_K = 6
+
+# Root directory for generated RAG data.
+RAG_ROOT = Path("rag_data")
+
+
+# =========================================================
+# GLOBAL LOGGING
+# =========================================================
 
 def setup_logging():
-    """
-    Configure application logging.
-
-    Logs are written to:
-    1. Terminal / PowerShell
-    2. youtube_chatbot.log
-    """
-
-    logger = logging.getLogger("youtube_chatbot")
+    logger = logging.getLogger("youtube_rag")
 
     if logger.handlers:
         return logger
@@ -59,34 +80,22 @@ def setup_logging():
     logger.setLevel(logging.DEBUG)
 
     formatter = logging.Formatter(
-        fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        "%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-
-    # -----------------------------------------------------
-    # File handler
-    # -----------------------------------------------------
 
     file_handler = logging.FileHandler(
         LOG_FILE,
         encoding="utf-8",
     )
 
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(formatter)
-
-    # -----------------------------------------------------
-    # Console handler
-    # -----------------------------------------------------
-
     console_handler = logging.StreamHandler()
 
+    file_handler.setLevel(logging.DEBUG)
     console_handler.setLevel(logging.DEBUG)
-    console_handler.setFormatter(formatter)
 
-    # -----------------------------------------------------
-    # Add handlers
-    # -----------------------------------------------------
+    file_handler.setFormatter(formatter)
+    console_handler.setFormatter(formatter)
 
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
@@ -100,23 +109,30 @@ logger = setup_logging()
 
 
 # =========================================================
-# STREAMLIT LOG STORAGE
+# STREAMLIT LOG STATE
 # =========================================================
 
 if "logs" not in st.session_state:
     st.session_state["logs"] = []
 
 
-def log_message(level, message):
+def log(level, message):
     """
-    Log message to terminal, file and Streamlit UI.
+    Log to:
+    - terminal
+    - youtube_chatbot.log
+    - Streamlit UI
     """
 
     timestamp = datetime.now().strftime("%H:%M:%S")
 
-    ui_message = f"[{timestamp}] {level.upper()} | {message}"
+    display_message = (
+        f"[{timestamp}] "
+        f"{level.upper()} | "
+        f"{message}"
+    )
 
-    st.session_state["logs"].append(ui_message)
+    st.session_state["logs"].append(display_message)
 
     if level == "debug":
         logger.debug(message)
@@ -134,16 +150,20 @@ def log_message(level, message):
         logger.info(message)
 
 
-def log_exception(message):
+def log_exception(message, local_logger=None):
     """
-    Log exception with complete traceback.
+    Log complete exception traceback.
     """
 
-    logger.error(message)
-    logger.error(traceback.format_exc())
+    target_logger = local_logger or logger
+
+    target_logger.error(message)
+    target_logger.error(traceback.format_exc())
+
+    timestamp = datetime.now().strftime("%H:%M:%S")
 
     st.session_state["logs"].append(
-        f"[{datetime.now().strftime('%H:%M:%S')}] ERROR | {message}"
+        f"[{timestamp}] ERROR | {message}"
     )
 
     st.session_state["logs"].append(
@@ -152,101 +172,275 @@ def log_exception(message):
 
 
 # =========================================================
-# ENVIRONMENT VARIABLES
+# ENVIRONMENT
 # =========================================================
-
-log_message("info", "Starting YouTube Transcript Retriever application.")
 
 load_dotenv()
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-if GROQ_API_KEY:
-
-    log_message(
-        "info",
-        "GROQ_API_KEY loaded successfully."
-    )
-
-else:
-
-    log_message(
+if not GEMINI_API_KEY:
+    log(
         "error",
-        "GROQ_API_KEY is missing from the .env file."
+        "GEMINI_API_KEY is missing from .env",
     )
 
     st.error(
-        "GROQ_API_KEY is missing from the .env file."
+        "GEMINI_API_KEY is missing from your .env file."
+    )
+
+    st.stop()
+
+
+log(
+    "info",
+    "GEMINI_API_KEY loaded successfully.",
+)
+
+
+# =========================================================
+# GEMINI CLIENT
+# =========================================================
+
+try:
+
+    gemini_client = genai.Client(
+        api_key=GEMINI_API_KEY
+    )
+
+    log(
+        "info",
+        (
+            "Gemini client initialized successfully. "
+            f"Model={GEMINI_MODEL}"
+        ),
+    )
+
+except Exception as error:
+
+    log_exception(
+        f"Failed to initialize Gemini client: {error}"
+    )
+
+    st.error(
+        f"Failed to initialize Gemini client: {error}"
     )
 
     st.stop()
 
 
 # =========================================================
-# YOUTUBE VIDEO ID EXTRACTION
+# OPTIONAL GEMINI MODEL VALIDATION
+# =========================================================
+
+def validate_gemini_model():
+    """
+    Attempt to verify that the configured Gemini model
+    is visible to the current API key.
+
+    Some API configurations may expose model aliases
+    differently, so failure of this diagnostic should not
+    automatically stop the application.
+    """
+
+    try:
+
+        log(
+            "info",
+            f"Checking Gemini model availability: {GEMINI_MODEL}",
+        )
+
+        models = list(
+            gemini_client.models.list()
+        )
+
+        model_names = []
+
+        for model in models:
+
+            name = getattr(
+                model,
+                "name",
+                None,
+            )
+
+            if name:
+
+                model_names.append(
+                    name.replace(
+                        "models/",
+                        "",
+                    )
+                )
+
+        log(
+            "info",
+            (
+                f"Gemini ModelService returned "
+                f"{len(model_names)} models."
+            ),
+        )
+
+        if GEMINI_MODEL in model_names:
+
+            log(
+                "info",
+                f"Gemini model confirmed: {GEMINI_MODEL}",
+            )
+
+        else:
+
+            log(
+                "warning",
+                (
+                    f"Configured model {GEMINI_MODEL} "
+                    "was not found in the returned model list. "
+                    "The model may still be available through "
+                    "the current endpoint."
+                ),
+            )
+
+    except Exception as error:
+
+        log(
+            "warning",
+            (
+                "Gemini model validation could not be completed: "
+                f"{error}"
+            ),
+        )
+
+
+validate_gemini_model()
+
+
+# =========================================================
+# CREATE PER-VIDEO LOGGER
+# =========================================================
+
+def create_video_logger(video_id):
+    """
+    Creates:
+
+    rag_data/<video_id>/processing.log
+    """
+
+    video_dir = (
+        RAG_ROOT / video_id
+    )
+
+    video_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    log_path = (
+        video_dir / PROCESSING_LOG_FILENAME
+    )
+
+    video_logger_name = (
+        f"youtube_rag.video.{video_id}"
+    )
+
+    video_logger = logging.getLogger(
+        video_logger_name
+    )
+
+    if video_logger.handlers:
+        return video_logger
+
+    video_logger.setLevel(
+        logging.DEBUG
+    )
+
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    file_handler = logging.FileHandler(
+        log_path,
+        encoding="utf-8",
+    )
+
+    file_handler.setLevel(
+        logging.DEBUG
+    )
+
+    file_handler.setFormatter(
+        formatter
+    )
+
+    video_logger.addHandler(
+        file_handler
+    )
+
+    video_logger.propagate = False
+
+    return video_logger
+
+
+# =========================================================
+# YOUTUBE VIDEO ID
 # =========================================================
 
 def extract_video_id(url):
-    """
-    Extract YouTube video ID without relying on pytube.
-
-    Supports:
-    - https://www.youtube.com/watch?v=VIDEO_ID
-    - https://youtu.be/VIDEO_ID
-    - https://www.youtube.com/shorts/VIDEO_ID
-    - https://www.youtube.com/embed/VIDEO_ID
-    """
-
-    log_message(
+    log(
         "info",
-        f"Starting YouTube URL parsing: {url}"
+        f"Parsing YouTube URL: {url}",
     )
 
     if not url:
-        log_message(
-            "error",
-            "Received empty YouTube URL."
-        )
         return None
 
     url = url.strip()
-
-    # -----------------------------------------------------
-    # Standard YouTube URL
-    # -----------------------------------------------------
 
     try:
 
         parsed = urlparse(url)
 
-        hostname = parsed.hostname or ""
+        hostname = (
+            parsed.hostname or ""
+        ).lower()
 
-        hostname = hostname.lower()
-
-        log_message(
+        log(
             "debug",
-            f"Parsed hostname: {hostname}"
+            f"Parsed hostname: {hostname}",
         )
 
-        # youtube.com/watch?v=...
+        # -------------------------------------------------
+        # Standard youtube.com/watch?v=
+        # -------------------------------------------------
+
         if "youtube.com" in hostname:
 
-            query_params = parse_qs(parsed.query)
+            query = parse_qs(
+                parsed.query
+            )
 
-            if "v" in query_params:
+            if "v" in query:
 
-                video_id = query_params["v"][0]
+                video_id = query["v"][0]
 
-                if video_id:
+                if re.fullmatch(
+                    r"[A-Za-z0-9_-]{11}",
+                    video_id,
+                ):
 
-                    log_message(
+                    log(
                         "info",
-                        f"Video ID extracted from watch URL: {video_id}"
+                        (
+                            "Extracted video ID from "
+                            f"watch URL: {video_id}"
+                        ),
                     )
 
                     return video_id
 
-            # /shorts/VIDEO_ID
+            # ---------------------------------------------
+            # Shorts
+            # ---------------------------------------------
+
             shorts_match = re.search(
                 r"/shorts/([A-Za-z0-9_-]{11})",
                 parsed.path,
@@ -254,16 +448,24 @@ def extract_video_id(url):
 
             if shorts_match:
 
-                video_id = shorts_match.group(1)
+                video_id = (
+                    shorts_match.group(1)
+                )
 
-                log_message(
+                log(
                     "info",
-                    f"Video ID extracted from Shorts URL: {video_id}"
+                    (
+                        "Extracted Shorts video ID: "
+                        f"{video_id}"
+                    ),
                 )
 
                 return video_id
 
-            # /embed/VIDEO_ID
+            # ---------------------------------------------
+            # Embed
+            # ---------------------------------------------
+
             embed_match = re.search(
                 r"/embed/([A-Za-z0-9_-]{11})",
                 parsed.path,
@@ -271,333 +473,191 @@ def extract_video_id(url):
 
             if embed_match:
 
-                video_id = embed_match.group(1)
+                video_id = (
+                    embed_match.group(1)
+                )
 
-                log_message(
+                log(
                     "info",
-                    f"Video ID extracted from embed URL: {video_id}"
+                    (
+                        "Extracted embed video ID: "
+                        f"{video_id}"
+                    ),
                 )
 
                 return video_id
 
         # -------------------------------------------------
-        # youtu.be/VIDEO_ID
+        # youtu.be
         # -------------------------------------------------
 
         if "youtu.be" in hostname:
 
-            video_id = parsed.path.strip("/").split("/")[0]
+            video_id = (
+                parsed.path
+                .strip("/")
+                .split("/")[0]
+            )
 
-            if video_id:
+            if re.fullmatch(
+                r"[A-Za-z0-9_-]{11}",
+                video_id,
+            ):
 
-                # Remove anything after whitespace
-                video_id = video_id.split()[0]
+                log(
+                    "info",
+                    (
+                        "Extracted youtu.be video ID: "
+                        f"{video_id}"
+                    ),
+                )
 
-                # Validate basic YouTube ID format
-                if re.fullmatch(
-                    r"[A-Za-z0-9_-]{11}",
-                    video_id,
-                ):
-
-                    log_message(
-                        "info",
-                        f"Video ID extracted from youtu.be URL: {video_id}"
-                    )
-
-                    return video_id
+                return video_id
 
     except Exception:
 
         log_exception(
-            "Exception occurred while parsing YouTube URL."
+            "Error while parsing YouTube URL."
         )
 
-        return None
-
-    # -----------------------------------------------------
-    # Final fallback regex
-    # -----------------------------------------------------
-
-    regex_patterns = [
-        r"(?:v=)([A-Za-z0-9_-]{11})",
-        r"(?:youtu\.be/)([A-Za-z0-9_-]{11})",
-        r"(?:shorts/)([A-Za-z0-9_-]{11})",
-        r"(?:embed/)([A-Za-z0-9_-]{11})",
-    ]
-
-    for pattern in regex_patterns:
-
-        match = re.search(
-            pattern,
-            url,
-        )
-
-        if match:
-
-            video_id = match.group(1)
-
-            log_message(
-                "info",
-                f"Video ID extracted using fallback regex: {video_id}"
-            )
-
-            return video_id
-
-    log_message(
+    log(
         "error",
-        "Unable to extract a valid YouTube video ID."
+        "Could not extract a valid YouTube video ID.",
     )
 
     return None
 
 
 # =========================================================
-# TRANSCRIPT ITEM TEXT EXTRACTION
+# TRANSCRIPT → TEXT
 # =========================================================
 
-def extract_text_from_transcript_items(transcript):
-    """
-    Convert transcript snippets to plain text.
-
-    Works with object-style snippets and dictionary-style snippets.
-    """
-
-    log_message(
+def transcript_to_text(transcript):
+    log(
         "debug",
-        "Converting transcript snippets into plain text."
+        "Converting transcript snippets to plain text.",
     )
 
-    text_parts = []
+    parts = []
 
     for item in transcript:
 
         try:
 
-            if hasattr(item, "text"):
+            if hasattr(
+                item,
+                "text",
+            ):
 
                 text = item.text
 
-            elif isinstance(item, dict):
+            elif isinstance(
+                item,
+                dict,
+            ):
 
-                text = item.get("text", "")
+                text = item.get(
+                    "text",
+                    "",
+                )
 
             else:
 
                 text = str(item)
 
             if text:
-
-                text_parts.append(text)
+                parts.append(text)
 
         except Exception:
 
-            log_message(
+            log(
                 "warning",
-                f"Could not parse transcript item: {item}"
+                (
+                    "Could not parse transcript item: "
+                    f"{item}"
+                ),
             )
 
-    result = " ".join(text_parts).strip()
+    result = (
+        " ".join(parts)
+        .strip()
+    )
 
-    log_message(
+    log(
         "info",
-        f"Transcript text assembled. Character count: {len(result)}"
+        (
+            "Transcript converted successfully. "
+            f"Characters={len(result):,}"
+        ),
     )
 
     return result
 
 
 # =========================================================
-# LIST AVAILABLE TRANSCRIPTS
+# GET YOUTUBE TRANSCRIPT
 # =========================================================
 
-def inspect_available_transcripts(api, video_id):
-    """
-    Retrieve and log metadata about available transcripts.
-    """
+def get_youtube_transcript(
+    url,
+    video_logger=None,
+):
 
-    log_message(
+    log(
         "info",
-        "Checking all available transcripts..."
+        "==================================================",
     )
 
-    try:
+    log(
+        "info",
+        "STARTING TRANSCRIPT RETRIEVAL",
+    )
 
-        transcript_list = api.list(video_id)
+    log(
+        "info",
+        "==================================================",
+    )
 
-        available_transcripts = []
-
-        for transcript in transcript_list:
-
-            language = getattr(
-                transcript,
-                "language",
-                "Unknown",
-            )
-
-            language_code = getattr(
-                transcript,
-                "language_code",
-                "Unknown",
-            )
-
-            is_generated = getattr(
-                transcript,
-                "is_generated",
-                "Unknown",
-            )
-
-            is_translatable = getattr(
-                transcript,
-                "is_translatable",
-                "Unknown",
-            )
-
-            available_transcripts.append(
-                {
-                    "language": language,
-                    "language_code": language_code,
-                    "is_generated": is_generated,
-                    "is_translatable": is_translatable,
-                }
-            )
-
-            log_message(
-                "info",
-                (
-                    f"Transcript found | "
-                    f"language={language} | "
-                    f"code={language_code} | "
-                    f"generated={is_generated} | "
-                    f"translatable={is_translatable}"
-                )
-            )
-
-        if not available_transcripts:
-
-            log_message(
-                "warning",
-                "Transcript list returned no entries."
-            )
-
-        else:
-
-            log_message(
-                "info",
-                f"Total available transcripts: {len(available_transcripts)}"
-            )
-
-        return transcript_list, available_transcripts
-
-    except TranscriptsDisabled:
-
-        log_message(
-            "error",
-            "YouTube reports that transcripts are disabled."
+    if video_logger:
+        video_logger.info(
+            "STARTING TRANSCRIPT RETRIEVAL"
         )
-
-        return None, []
-
-    except NoTranscriptFound:
-
-        log_message(
-            "warning",
-            "No transcripts were found for this video."
-        )
-
-        return None, []
-
-    except Exception:
-
-        log_exception(
-            "Unexpected error while listing transcripts."
-        )
-
-        return None, []
-
-
-# =========================================================
-# FETCH YOUTUBE TRANSCRIPT
-# =========================================================
-
-def get_youtube_transcript(url):
-    """
-    Fetch YouTube transcript.
-
-    Strategy:
-    1. Extract video ID.
-    2. Inspect all available transcripts.
-    3. Prefer English.
-    4. Fall back to first available transcript.
-    5. Convert transcript to plain text.
-    """
-
-    log_message(
-        "info",
-        "=================================================="
-    )
-
-    log_message(
-        "info",
-        "STARTING TRANSCRIPT RETRIEVAL"
-    )
-
-    log_message(
-        "info",
-        "=================================================="
-    )
-
-    # -----------------------------------------------------
-    # Extract video ID
-    # -----------------------------------------------------
 
     video_id = extract_video_id(url)
 
     if not video_id:
 
         st.error(
-            "Could not extract a valid YouTube video ID."
+            "Invalid YouTube URL."
         )
 
         return None
 
-    log_message(
-        "info",
-        f"Using YouTube video ID: {video_id}"
-    )
-
-    # -----------------------------------------------------
-    # Create transcript API client
-    # -----------------------------------------------------
-
     try:
-
-        log_message(
-            "info",
-            "Creating YouTubeTranscriptApi client..."
-        )
 
         api = YouTubeTranscriptApi()
 
-        log_message(
+        log(
             "info",
-            "YouTubeTranscriptApi client created successfully."
+            "YouTubeTranscriptApi initialized.",
         )
 
     except Exception:
 
         log_exception(
-            "Failed to initialize YouTubeTranscriptApi."
+            "Failed to initialize YouTubeTranscriptApi.",
+            video_logger,
         )
 
         return None
 
     # -----------------------------------------------------
-    # First attempt: direct English fetch
+    # Direct English transcript
     # -----------------------------------------------------
 
-    log_message(
+    log(
         "info",
-        "Attempting direct English transcript retrieval..."
+        "Attempting English transcript retrieval.",
     )
 
     try:
@@ -611,120 +671,180 @@ def get_youtube_transcript(url):
             ],
         )
 
-        log_message(
-            "info",
-            "English transcript retrieved successfully."
-        )
-
-        transcript_data = transcript
-
-        text = extract_text_from_transcript_items(
-            transcript_data
+        text = transcript_to_text(
+            transcript
         )
 
         if text:
 
-            log_message(
+            log(
                 "info",
-                "Direct English transcript contains usable text."
-            )
-
-            log_message(
-                "info",
-                f"Final transcript length: {len(text)} characters."
+                "English transcript retrieved successfully.",
             )
 
             return text
 
-        log_message(
-            "warning",
-            "Direct English transcript returned empty text."
-        )
-
     except NoTranscriptFound:
 
-        log_message(
+        log(
             "warning",
-            "English transcript not found. Inspecting available languages..."
+            "No English transcript available.",
         )
 
     except TranscriptsDisabled:
 
-        log_message(
+        log(
             "error",
-            "Transcripts are disabled for this video."
+            "Transcripts are disabled.",
         )
 
         st.error(
-            "❌ Transcripts are disabled for this video."
+            "Transcripts are disabled for this video."
         )
 
         return None
 
     except VideoUnavailable:
 
-        log_message(
+        log(
             "error",
-            "Video is unavailable."
+            "Video is unavailable.",
         )
 
         st.error(
-            "❌ This YouTube video is unavailable."
+            "This YouTube video is unavailable."
         )
 
         return None
 
     except CouldNotRetrieveTranscript as error:
 
-        log_message(
+        log(
             "warning",
-            f"Could not directly retrieve English transcript: {error}"
+            (
+                "English transcript retrieval failed: "
+                f"{error}"
+            ),
         )
 
     except Exception:
 
         log_exception(
-            "Unexpected error during direct transcript retrieval."
+            (
+                "Unexpected error during "
+                "English transcript retrieval."
+            ),
+            video_logger,
         )
 
     # -----------------------------------------------------
-    # Inspect available transcripts
+    # List available transcripts
     # -----------------------------------------------------
 
-    transcript_list, available_transcripts = (
-        inspect_available_transcripts(
-            api,
-            video_id,
-        )
+    log(
+        "info",
+        "Checking available transcript languages.",
     )
 
-    if transcript_list is None:
+    try:
 
-        st.error(
-            "❌ No transcript could be retrieved for this video."
+        transcript_list = api.list(
+            video_id
         )
 
-        log_message(
+        available_count = 0
+
+        for transcript in transcript_list:
+
+            language = getattr(
+                transcript,
+                "language",
+                "Unknown",
+            )
+
+            code = getattr(
+                transcript,
+                "language_code",
+                "Unknown",
+            )
+
+            generated = getattr(
+                transcript,
+                "is_generated",
+                False,
+            )
+
+            translatable = getattr(
+                transcript,
+                "is_translatable",
+                False,
+            )
+
+            available_count += 1
+
+            log(
+                "info",
+                (
+                    f"Transcript found | "
+                    f"language={language} | "
+                    f"code={code} | "
+                    f"generated={generated} | "
+                    f"translatable={translatable}"
+                ),
+            )
+
+        log(
+            "info",
+            (
+                "Total transcripts available: "
+                f"{available_count}"
+            ),
+        )
+
+    except NoTranscriptFound:
+
+        log(
             "error",
-            "Transcript list could not be retrieved."
+            "No transcripts exist for this video.",
+        )
+
+        st.error(
+            "No transcript is available for this video."
+        )
+
+        return None
+
+    except TranscriptsDisabled:
+
+        log(
+            "error",
+            "YouTube reports transcripts are disabled.",
+        )
+
+        st.error(
+            "Transcripts are disabled for this video."
+        )
+
+        return None
+
+    except Exception:
+
+        log_exception(
+            "Failed to list available transcripts.",
+            video_logger,
         )
 
         return None
 
     # -----------------------------------------------------
-    # Find English transcript
+    # Prefer English
     # -----------------------------------------------------
 
-    selected_transcript = None
-
-    log_message(
-        "info",
-        "Searching for English transcript..."
-    )
+    selected = None
 
     try:
 
-        selected_transcript = (
+        selected = (
             transcript_list.find_transcript(
                 [
                     "en",
@@ -734,63 +854,55 @@ def get_youtube_transcript(url):
             )
         )
 
-        log_message(
+        log(
             "info",
             (
-                "English transcript selected: "
-                f"{selected_transcript.language} "
-                f"({selected_transcript.language_code})"
-            )
+                "Selected English transcript: "
+                f"{selected.language} "
+                f"({selected.language_code})"
+            ),
         )
 
     except NoTranscriptFound:
 
-        log_message(
+        log(
             "warning",
-            "No English transcript available."
+            "English transcript unavailable.",
         )
 
     except Exception:
 
         log_exception(
-            "Error while searching for English transcript."
+            "Error while searching for English transcript.",
+            video_logger,
         )
 
     # -----------------------------------------------------
-    # Fallback to first available transcript
+    # Fallback transcript
     # -----------------------------------------------------
 
-    if selected_transcript is None:
-
-        log_message(
-            "warning",
-            "Falling back to first available transcript."
-        )
+    if selected is None:
 
         try:
 
-            selected_transcript = next(
+            selected = next(
                 iter(transcript_list)
             )
 
-            log_message(
+            log(
                 "info",
                 (
-                    "Fallback transcript selected: "
-                    f"{selected_transcript.language} "
-                    f"({selected_transcript.language_code})"
-                )
+                    "Using fallback transcript: "
+                    f"{selected.language} "
+                    f"({selected.language_code})"
+                ),
             )
 
         except StopIteration:
 
-            log_message(
+            log(
                 "error",
-                "Transcript list is empty."
-            )
-
-            st.error(
-                "❌ No usable transcript is available."
+                "Transcript list is empty.",
             )
 
             return None
@@ -798,7 +910,11 @@ def get_youtube_transcript(url):
         except Exception:
 
             log_exception(
-                "Failed to select fallback transcript."
+                (
+                    "Failed to select "
+                    "fallback transcript."
+                ),
+                video_logger,
             )
 
             return None
@@ -809,184 +925,183 @@ def get_youtube_transcript(url):
 
     try:
 
-        log_message(
+        log(
             "info",
-            "Fetching selected transcript..."
+            "Fetching selected transcript.",
         )
 
-        fetched_transcript = (
-            selected_transcript.fetch()
-        )
+        fetched = selected.fetch()
 
-        log_message(
-            "info",
-            "Selected transcript fetched successfully."
-        )
-
-        text = extract_text_from_transcript_items(
-            fetched_transcript
+        text = transcript_to_text(
+            fetched
         )
 
         if not text:
 
-            log_message(
+            log(
                 "error",
-                "Fetched transcript contains no text."
-            )
-
-            st.error(
-                "❌ Transcript was retrieved but contains no text."
+                "Transcript was fetched but contains no text.",
             )
 
             return None
 
-        log_message(
+        preview = (
+            text[:500]
+            .replace("\n", " ")
+        )
+
+        log(
             "info",
-            f"Final transcript length: {len(text)} characters."
+            (
+                "Transcript successfully fetched. "
+                f"Characters={len(text):,}"
+            ),
         )
 
-        # -------------------------------------------------
-        # Preview for logs
-        # -------------------------------------------------
-
-        preview = text[:500].replace(
-            "\n",
-            " ",
-        )
-
-        log_message(
+        log(
             "debug",
-            f"Transcript preview: {preview}"
-        )
-
-        log_message(
-            "info",
-            "Transcript retrieval completed successfully."
+            f"Transcript preview: {preview}",
         )
 
         return text
 
     except TranscriptsDisabled:
 
-        log_message(
+        log(
             "error",
-            "Transcripts are disabled."
+            "Transcripts are disabled.",
         )
 
         st.error(
-            "❌ Transcripts are disabled for this video."
+            "Transcripts are disabled for this video."
         )
 
     except NoTranscriptFound:
 
-        log_message(
+        log(
             "error",
-            "No transcript found after fallback selection."
-        )
-
-        st.error(
-            "❌ No transcript could be retrieved."
+            "No transcript found after selection.",
         )
 
     except VideoUnavailable:
 
-        log_message(
+        log(
             "error",
-            "Video became unavailable while retrieving transcript."
-        )
-
-        st.error(
-            "❌ Video is unavailable."
+            "Video unavailable during transcript fetch.",
         )
 
     except CouldNotRetrieveTranscript as error:
 
-        log_message(
+        log(
             "error",
-            f"Could not retrieve transcript: {error}"
+            (
+                "Could not retrieve transcript: "
+                f"{error}"
+            ),
         )
 
         st.error(
-            f"❌ Could not retrieve transcript: {error}"
+            f"Could not retrieve transcript: {error}"
         )
 
     except Exception:
 
         log_exception(
-            "Unexpected error while fetching selected transcript."
+            "Failed to fetch selected transcript.",
+            video_logger,
         )
 
         st.error(
-            "❌ An unexpected error occurred while retrieving the transcript."
+            "An unexpected error occurred while "
+            "retrieving the transcript."
         )
 
     return None
 
 
 # =========================================================
-# CREATE RAG QA CHAIN
+# SAVE JSON UTILITY
 # =========================================================
 
-def create_qa_chain(transcript_text):
-    """
-    Create:
+def save_json(path, data):
+    with open(
+        path,
+        "w",
+        encoding="utf-8",
+    ) as file:
 
-    Transcript
-        ↓
-    Text chunks
-        ↓
-    HuggingFace embeddings
-        ↓
-    FAISS vector store
-        ↓
-    Groq LLM
-        ↓
-    RetrievalQA
-    """
-
-    log_message(
-        "info",
-        "=================================================="
-    )
-
-    log_message(
-        "info",
-        "STARTING RAG PIPELINE"
-    )
-
-    log_message(
-        "info",
-        "=================================================="
-    )
-
-    # -----------------------------------------------------
-    # Validate transcript
-    # -----------------------------------------------------
-
-    if not transcript_text:
-
-        raise ValueError(
-            "Transcript text is empty."
+        json.dump(
+            data,
+            file,
+            ensure_ascii=False,
+            indent=2,
         )
 
-    log_message(
+
+# =========================================================
+# BUILD VECTOR STORE
+# =========================================================
+
+def create_vector_store(
+    transcript_text,
+    video_id,
+    video_logger=None,
+):
+
+    log(
         "info",
-        f"Transcript received: {len(transcript_text)} characters."
+        "==================================================",
+    )
+
+    log(
+        "info",
+        "STARTING RAG PIPELINE",
+    )
+
+    log(
+        "info",
+        "==================================================",
+    )
+
+    if video_logger:
+        video_logger.info(
+            "STARTING RAG PIPELINE"
+        )
+
+    if not transcript_text:
+        raise ValueError(
+            "Transcript is empty."
+        )
+
+    # -----------------------------------------------------
+    # Directory
+    # -----------------------------------------------------
+
+    output_dir = (
+        RAG_ROOT / video_id
+    )
+
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    log(
+        "info",
+        f"RAG storage directory: {output_dir}",
     )
 
     # -----------------------------------------------------
-    # Save transcript
+    # Transcript
     # -----------------------------------------------------
 
-    transcript_file = "transcript.txt"
-
-    log_message(
-        "info",
-        f"Saving transcript to {transcript_file}..."
+    transcript_path = (
+        output_dir /
+        TRANSCRIPT_FILENAME
     )
 
     with open(
-        transcript_file,
+        transcript_path,
         "w",
         encoding="utf-8",
     ) as file:
@@ -995,101 +1110,132 @@ def create_qa_chain(transcript_text):
             transcript_text
         )
 
-    log_message(
+    log(
         "info",
-        "Transcript saved successfully."
+        f"Transcript saved: {transcript_path}",
     )
 
     # -----------------------------------------------------
-    # Load transcript
+    # Text loader
     # -----------------------------------------------------
-
-    log_message(
-        "info",
-        "Loading transcript using TextLoader..."
-    )
 
     loader = TextLoader(
-        transcript_file,
+        str(transcript_path),
         encoding="utf-8",
     )
 
     documents = loader.load()
 
-    log_message(
+    log(
         "info",
-        f"Loaded documents: {len(documents)}"
+        f"Loaded documents: {len(documents)}",
     )
 
-    if not documents:
-
-        raise ValueError(
-            "TextLoader returned no documents."
-        )
-
     # -----------------------------------------------------
-    # Text splitting
+    # Recursive chunking
     # -----------------------------------------------------
 
-    log_message(
-        "info",
-        "Splitting transcript into chunks..."
-    )
-
-    splitter = CharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        separators=[
+            "\n\n",
+            "\n",
+            ". ",
+            "? ",
+            "! ",
+            " ",
+            "",
+        ],
     )
 
     chunks = splitter.split_documents(
         documents
     )
 
-    log_message(
+    log(
         "info",
-        f"Created {len(chunks)} transcript chunks."
+        (
+            f"Created {len(chunks)} chunks "
+            f"(chunk_size={CHUNK_SIZE}, "
+            f"overlap={CHUNK_OVERLAP})"
+        ),
     )
 
     if not chunks:
-
         raise ValueError(
-            "No transcript chunks were created."
+            "No chunks were created."
         )
+
+    # -----------------------------------------------------
+    # Chunk metadata
+    # -----------------------------------------------------
+
+    chunks_data = []
+
+    for index, document in enumerate(
+        chunks
+    ):
+
+        text = (
+            document.page_content
+            .strip()
+        )
+
+        chunks_data.append(
+            {
+                "chunk_id": index,
+                "text": text,
+                "character_count": len(text),
+                "word_count": len(
+                    text.split()
+                ),
+            }
+        )
+
+    chunks_path = (
+        output_dir /
+        CHUNKS_FILENAME
+    )
+
+    save_json(
+        chunks_path,
+        chunks_data,
+    )
+
+    log(
+        "info",
+        f"Chunk data saved: {chunks_path}",
+    )
 
     # -----------------------------------------------------
     # Embeddings
     # -----------------------------------------------------
 
-    log_message(
+    log(
         "info",
-        "Initializing HuggingFace embeddings..."
-    )
-
-    embedding_model = (
-        "sentence-transformers/all-MiniLM-L6-v2"
-    )
-
-    log_message(
-        "info",
-        f"Embedding model: {embedding_model}"
+        (
+            "Loading embedding model: "
+            f"{EMBEDDING_MODEL}"
+        ),
     )
 
     embeddings = HuggingFaceEmbeddings(
-        model_name=embedding_model
+        model_name=EMBEDDING_MODEL
     )
 
-    log_message(
+    log(
         "info",
-        "HuggingFace embeddings initialized successfully."
+        "Embedding model loaded successfully.",
     )
 
     # -----------------------------------------------------
-    # FAISS
+    # Generate vectors / FAISS
     # -----------------------------------------------------
 
-    log_message(
+    log(
         "info",
-        "Creating FAISS vector store..."
+        "Generating embeddings and creating FAISS index.",
     )
 
     vector_store = FAISS.from_documents(
@@ -1097,81 +1243,733 @@ def create_qa_chain(transcript_text):
         embeddings,
     )
 
-    log_message(
+    log(
         "info",
-        "FAISS vector store created successfully."
+        "FAISS vector store created successfully.",
     )
 
     # -----------------------------------------------------
-    # Groq
+    # Embedding statistics
     # -----------------------------------------------------
 
-    log_message(
-        "info",
-        "Initializing Groq LLM..."
+    vector_count = (
+        vector_store.index.ntotal
     )
 
-    groq_model = "openai/gpt-oss-20b"
-
-    log_message(
-        "info",
-        f"Groq model: {groq_model}"
+    vector_dimension = (
+        vector_store.index.d
     )
 
-    llm = ChatGroq(
-        model=groq_model,
-        temperature=0,
-        groq_api_key=GROQ_API_KEY,
+    log(
+        "info",
+        f"FAISS vector count: {vector_count}",
     )
 
-    log_message(
+    log(
         "info",
-        "Groq LLM initialized successfully."
+        f"Embedding dimension: {vector_dimension}",
     )
 
     # -----------------------------------------------------
-    # RetrievalQA
+    # Extract actual vectors
     # -----------------------------------------------------
 
-    log_message(
-        "info",
-        "Creating RetrievalQA chain..."
-    )
-
-    qa_chain = RetrievalQA.from_chain_type(
-        llm=llm,
-        retriever=vector_store.as_retriever(
-            search_kwargs={
-                "k": 4
-            }
+    vectors = np.zeros(
+        (
+            vector_count,
+            vector_dimension,
         ),
-        return_source_documents=False,
+        dtype=np.float32,
     )
 
-    log_message(
+    if vector_count > 0:
+
+        vector_store.index.reconstruct_n(
+            0,
+            vector_count,
+            vectors,
+        )
+
+    embeddings_path = (
+        output_dir /
+        EMBEDDINGS_FILENAME
+    )
+
+    np.save(
+        embeddings_path,
+        vectors,
+    )
+
+    log(
         "info",
-        "RetrievalQA chain created successfully."
+        f"Embedding matrix saved: {embeddings_path}",
     )
 
-    log_message(
+    log(
         "info",
-        "RAG pipeline completed successfully."
+        f"Embedding matrix shape: {vectors.shape}",
     )
 
-    return qa_chain
+    log(
+        "info",
+        (
+            f"Embedding matrix size: "
+            f"{vectors.nbytes / (1024 * 1024):.2f} MB"
+        ),
+    )
+
+    # -----------------------------------------------------
+    # Save FAISS
+    # -----------------------------------------------------
+
+    vector_store.save_local(
+        str(output_dir)
+    )
+
+    log(
+        "info",
+        (
+            "FAISS files saved in: "
+            f"{output_dir}"
+        ),
+    )
+
+    # -----------------------------------------------------
+    # Statistics
+    # -----------------------------------------------------
+
+    total_characters = sum(
+        chunk["character_count"]
+        for chunk in chunks_data
+    )
+
+    total_words = sum(
+        chunk["word_count"]
+        for chunk in chunks_data
+    )
+
+    average_chunk_length = (
+        total_characters /
+        len(chunks_data)
+    )
+
+    average_chunk_words = (
+        total_words /
+        len(chunks_data)
+    )
+
+    largest_chunk = max(
+        chunk["character_count"]
+        for chunk in chunks_data
+    )
+
+    smallest_chunk = min(
+        chunk["character_count"]
+        for chunk in chunks_data
+    )
+
+    metadata = {
+        "video_id": video_id,
+        "generated_at": datetime.now().isoformat(),
+
+        "transcript": {
+            "characters": len(
+                transcript_text
+            ),
+            "words": len(
+                transcript_text.split()
+            ),
+        },
+
+        "chunking": {
+            "chunk_count": len(
+                chunks_data
+            ),
+            "chunk_size": CHUNK_SIZE,
+            "chunk_overlap": CHUNK_OVERLAP,
+            "average_chunk_characters": round(
+                average_chunk_length,
+                2,
+            ),
+            "average_chunk_words": round(
+                average_chunk_words,
+                2,
+            ),
+            "smallest_chunk_characters": (
+                smallest_chunk
+            ),
+            "largest_chunk_characters": (
+                largest_chunk
+            ),
+        },
+
+        "embeddings": {
+            "model": EMBEDDING_MODEL,
+            "count": vector_count,
+            "dimension": vector_dimension,
+            "dtype": str(
+                vectors.dtype
+            ),
+        },
+
+        "retrieval": {
+            "top_k": TOP_K,
+        },
+
+        "gemini": {
+            "model": GEMINI_MODEL,
+        },
+    }
+
+    metadata_path = (
+        output_dir /
+        METADATA_FILENAME
+    )
+
+    save_json(
+        metadata_path,
+        metadata,
+    )
+
+    log(
+        "info",
+        f"Metadata saved: {metadata_path}",
+    )
+
+    # -----------------------------------------------------
+    # Write processing event
+    # -----------------------------------------------------
+
+    if video_logger:
+
+        video_logger.info(
+            (
+                "RAG COMPLETE | "
+                f"transcript_chars={len(transcript_text)} | "
+                f"chunks={len(chunks_data)} | "
+                f"embeddings={vector_count} | "
+                f"dimension={vector_dimension}"
+            )
+        )
+
+    log(
+        "info",
+        "RAG storage completed successfully.",
+    )
+
+    log(
+        "info",
+        f"  Transcript : {transcript_path}",
+    )
+
+    log(
+        "info",
+        f"  Chunks     : {chunks_path}",
+    )
+
+    log(
+        "info",
+        f"  Embeddings : {embeddings_path}",
+    )
+
+    log(
+        "info",
+        f"  FAISS      : {output_dir}",
+    )
+
+    log(
+        "info",
+        f"  Metadata   : {metadata_path}",
+    )
+
+    return vector_store
 
 
 # =========================================================
-# UI HEADER
+# RETRIEVAL
+# =========================================================
+
+def retrieve_context(
+    vector_store,
+    question,
+):
+
+    log(
+        "info",
+        (
+            "Retrieving relevant context for: "
+            f"{question}"
+        ),
+    )
+
+    documents = vector_store.similarity_search(
+        question,
+        k=TOP_K,
+    )
+
+    log(
+        "info",
+        (
+            f"Retrieved {len(documents)} "
+            "relevant chunks."
+        ),
+    )
+
+    context_parts = []
+
+    retrieved_metadata = []
+
+    for index, document in enumerate(
+        documents,
+        start=1,
+    ):
+
+        content = (
+            document.page_content
+            .strip()
+        )
+
+        log(
+            "debug",
+            (
+                f"Retrieved chunk {index}: "
+                f"{len(content)} characters."
+            ),
+        )
+
+        retrieved_metadata.append(
+            {
+                "rank": index,
+                "characters": len(
+                    content
+                ),
+                "words": len(
+                    content.split()
+                ),
+            }
+        )
+
+        context_parts.append(
+            f"""
+--- CONTEXT CHUNK {index} ---
+{content}
+"""
+        )
+
+    context = (
+        "\n".join(
+            context_parts
+        )
+        .strip()
+    )
+
+    log(
+        "info",
+        (
+            f"Final retrieved context: "
+            f"{len(context):,} characters."
+        ),
+    )
+
+    return (
+        context,
+        retrieved_metadata,
+    )
+
+
+# =========================================================
+# COUNT GEMINI TOKENS
+# =========================================================
+
+def count_gemini_tokens(
+    contents,
+):
+
+    try:
+
+        response = (
+            gemini_client.models.count_tokens(
+                model=GEMINI_MODEL,
+                contents=contents,
+            )
+        )
+
+        total_tokens = getattr(
+            response,
+            "total_tokens",
+            None,
+        )
+
+        if total_tokens is not None:
+
+            log(
+                "info",
+                (
+                    "Gemini token count: "
+                    f"{total_tokens:,}"
+                ),
+            )
+
+        return total_tokens
+
+    except Exception as error:
+
+        log(
+            "warning",
+            (
+                "Could not count Gemini tokens: "
+                f"{error}"
+            ),
+        )
+
+        return None
+
+
+# =========================================================
+# SAVE TOKEN USAGE
+# =========================================================
+
+def save_token_usage(
+    video_id,
+    question,
+    context,
+    retrieved_metadata,
+    gemini_input_tokens,
+    response,
+):
+
+    output_dir = (
+        RAG_ROOT / video_id
+    )
+
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    response_usage = getattr(
+        response,
+        "usage_metadata",
+        None,
+    )
+
+    prompt_tokens = None
+    output_tokens = None
+    total_tokens = None
+
+    if response_usage:
+
+        if isinstance(
+            response_usage,
+            dict,
+        ):
+
+            prompt_tokens = (
+                response_usage.get(
+                    "prompt_token_count"
+                )
+                or response_usage.get(
+                    "promptTokenCount"
+                )
+                or response_usage.get(
+                    "input_tokens"
+                )
+            )
+
+            output_tokens = (
+                response_usage.get(
+                    "candidates_token_count"
+                )
+                or response_usage.get(
+                    "candidatesTokenCount"
+                )
+                or response_usage.get(
+                    "output_tokens"
+                )
+            )
+
+            total_tokens = (
+                response_usage.get(
+                    "total_token_count"
+                )
+                or response_usage.get(
+                    "totalTokenCount"
+                )
+                or response_usage.get(
+                    "total_tokens"
+                )
+            )
+
+        else:
+
+            prompt_tokens = getattr(
+                response_usage,
+                "prompt_token_count",
+                None,
+            )
+
+            output_tokens = getattr(
+                response_usage,
+                "candidates_token_count",
+                None,
+            )
+
+            total_tokens = getattr(
+                response_usage,
+                "total_token_count",
+                None,
+            )
+
+    usage_record = {
+        "timestamp": datetime.now().isoformat(),
+
+        "model": GEMINI_MODEL,
+
+        "question": question,
+
+        "question_characters": len(
+            question
+        ),
+
+        "retrieved_context": {
+            "characters": len(
+                context
+            ),
+            "words": len(
+                context.split()
+            ),
+            "chunks": retrieved_metadata,
+        },
+
+        "gemini": {
+            "count_tokens_result": (
+                gemini_input_tokens
+            ),
+            "prompt_tokens": (
+                prompt_tokens
+            ),
+            "output_tokens": (
+                output_tokens
+            ),
+            "total_tokens": (
+                total_tokens
+            ),
+        },
+
+        "answer": {
+            "characters": len(
+                response.text or ""
+            ),
+        },
+    }
+
+    usage_path = (
+        output_dir /
+        TOKEN_USAGE_FILENAME
+    )
+
+    # Preserve previous questions instead of overwriting.
+    existing_records = []
+
+    if usage_path.exists():
+
+        try:
+
+            with open(
+                usage_path,
+                "r",
+                encoding="utf-8",
+            ) as file:
+
+                existing = json.load(
+                    file
+                )
+
+                if isinstance(
+                    existing,
+                    list,
+                ):
+
+                    existing_records = existing
+
+        except Exception:
+
+            existing_records = []
+
+    existing_records.append(
+        usage_record
+    )
+
+    save_json(
+        usage_path,
+        existing_records,
+    )
+
+    log(
+        "info",
+        (
+            f"Token usage saved: "
+            f"{usage_path}"
+        ),
+    )
+
+    log(
+        "info",
+        (
+            "Gemini usage | "
+            f"prompt={prompt_tokens} | "
+            f"output={output_tokens} | "
+            f"total={total_tokens}"
+        ),
+    )
+
+
+# =========================================================
+# ASK GEMINI
+# =========================================================
+
+def ask_gemini(
+    video_id,
+    question,
+    context,
+    retrieved_metadata,
+):
+
+    log(
+        "info",
+        "Sending question to Gemini.",
+    )
+
+    system_instruction = """
+You are a YouTube video question-answering assistant.
+
+Answer the user's question using the provided transcript context.
+
+Rules:
+1. Use the transcript context as the primary source.
+2. Do not invent facts that are not supported by the transcript.
+3. If the answer is not present in the retrieved context,
+   clearly say that the transcript does not provide enough information.
+4. You may answer in English even if the transcript is in another language.
+5. Keep the answer clear, useful, and direct.
+6. Preserve important technical terminology.
+7. If the transcript is auto-generated and the wording seems imperfect,
+   interpret it carefully using the surrounding context.
+"""
+
+    prompt = f"""
+{system_instruction}
+
+TRANSCRIPT CONTEXT:
+{context}
+
+USER QUESTION:
+{question}
+
+ANSWER:
+"""
+
+    # -----------------------------------------------------
+    # Count tokens BEFORE generation
+    # -----------------------------------------------------
+
+    log(
+        "info",
+        "Counting Gemini input tokens.",
+    )
+
+    input_token_count = (
+        count_gemini_tokens(
+            prompt
+        )
+    )
+
+    # -----------------------------------------------------
+    # Generate
+    # -----------------------------------------------------
+
+    try:
+
+        response = (
+            gemini_client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.2,
+                    max_output_tokens=2048,
+                ),
+            )
+        )
+
+        answer = (
+            response.text or ""
+        ).strip()
+
+        if not answer:
+
+            raise ValueError(
+                "Gemini returned an empty response."
+            )
+
+        log(
+            "info",
+            (
+                "Gemini response received. "
+                f"Characters={len(answer):,}"
+            ),
+        )
+
+        log(
+            "debug",
+            f"Gemini answer: {answer}",
+        )
+
+        # -------------------------------------------------
+        # Save usage
+        # -------------------------------------------------
+
+        save_token_usage(
+            video_id=video_id,
+            question=question,
+            context=context,
+            retrieved_metadata=retrieved_metadata,
+            gemini_input_tokens=input_token_count,
+            response=response,
+        )
+
+        return answer
+
+    except Exception:
+
+        log_exception(
+            "Gemini request failed."
+        )
+
+        raise
+
+
+# =========================================================
+# MAIN UI
 # =========================================================
 
 st.title(
-    "🎥 YouTube Transcript Retriever - Groq RAG"
+    "🎥 YouTube RAG Chatbot"
+)
+
+st.caption(
+    (
+        "YouTube Transcript → "
+        "Chunking → Embeddings → FAISS → "
+        "Gemini 3.6 Flash"
+    )
 )
 
 st.write(
-    "Enter a YouTube video URL, process its transcript, "
-    "and ask questions about the video."
+    (
+        "Process a YouTube video's transcript, "
+        "build a local vector index, and ask "
+        "questions about the video."
+    )
 )
 
 
@@ -1181,47 +1979,80 @@ st.write(
 
 with st.sidebar:
 
-    st.header("⚙️ Debug Information")
+    st.header("⚙️ System")
 
     st.write(
-        f"Python logging file: `{LOG_FILE}`"
+        f"**LLM:** `{GEMINI_MODEL}`"
     )
 
-    if st.button("Clear UI Logs"):
+    st.write(
+        f"**Embeddings:** `{EMBEDDING_MODEL}`"
+    )
 
-        st.session_state["logs"] = []
+    st.write(
+        f"**Chunk size:** `{CHUNK_SIZE}`"
+    )
+
+    st.write(
+        f"**Chunk overlap:** `{CHUNK_OVERLAP}`"
+    )
+
+    st.write(
+        f"**Top-K:** `{TOP_K}`"
+    )
+
+    st.divider()
+
+    st.write(
+        "**Saved artifacts**"
+    )
+
+    st.code(
+        (
+            "transcript.txt\n"
+            "chunks.json\n"
+            "embeddings.npy\n"
+            "index.faiss\n"
+            "index.pkl\n"
+            "metadata.json\n"
+            "token_usage.json\n"
+            "processing.log"
+        ),
+        language="text",
+    )
+
+    st.divider()
+
+    if st.button(
+        "Clear Logs"
+    ):
+
+        st.session_state[
+            "logs"
+        ] = []
 
         st.rerun()
 
     st.divider()
 
-    st.write(
-        "### Runtime"
-    )
-
-    st.write(
-        f"Python executable:"
+    st.caption(
+        "Global log file:"
     )
 
     st.code(
-        os.sys.executable
-    )
-
-    st.write(
-        f"Working directory:"
-    )
-
-    st.code(
-        os.getcwd()
+        os.path.abspath(
+            LOG_FILE
+        ),
+        language="text",
     )
 
 
 # =========================================================
-# YOUTUBE URL INPUT
+# VIDEO INPUT
 # =========================================================
 
 video_url = st.text_input(
-    "Enter YouTube video URL:",
+    "YouTube URL",
     placeholder=(
         "https://www.youtube.com/watch?v=..."
     ),
@@ -1237,20 +2068,27 @@ if st.button(
     type="primary",
 ):
 
-    # Clear previous logs for this processing attempt
-    st.session_state["logs"] = []
+    st.session_state[
+        "logs"
+    ] = []
 
-    log_message(
+    # Clear previous current-session vector store.
+    st.session_state.pop(
+        "vector_store",
+        None,
+    )
+
+    st.session_state.pop(
+        "video_id",
+        None,
+    )
+
+    log(
         "info",
-        "User clicked 'Process Video'."
+        "User clicked Process Video.",
     )
 
     if not video_url.strip():
-
-        log_message(
-            "warning",
-            "User submitted an empty URL."
-        )
 
         st.warning(
             "Please enter a YouTube URL."
@@ -1259,92 +2097,145 @@ if st.button(
     else:
 
         with st.spinner(
-            "Processing YouTube video..."
+            (
+                "Downloading transcript, "
+                "creating embeddings, and "
+                "building FAISS..."
+            )
         ):
 
             try:
 
-                transcript_text = (
-                    get_youtube_transcript(
+                # -----------------------------------------
+                # Extract video ID
+                # -----------------------------------------
+
+                video_id = (
+                    extract_video_id(
                         video_url
                     )
                 )
 
-                # -------------------------------------------------
-                # Transcript successfully retrieved
-                # -------------------------------------------------
+                if not video_id:
 
-                if transcript_text:
-
-                    log_message(
-                        "info",
-                        "Transcript successfully retrieved."
+                    st.error(
+                        "Could not determine the YouTube video ID."
                     )
 
-                    # -------------------------------------------------
-                    # Create QA chain
-                    # -------------------------------------------------
+                    st.stop()
 
-                    qa_chain = (
-                        create_qa_chain(
-                            transcript_text
+                # -----------------------------------------
+                # Per-video logger
+                # -----------------------------------------
+
+                video_logger = (
+                    create_video_logger(
+                        video_id
+                    )
+                )
+
+                video_logger.info(
+                    f"Processing video: {video_id}"
+                )
+
+                # -----------------------------------------
+                # Transcript
+                # -----------------------------------------
+
+                transcript = (
+                    get_youtube_transcript(
+                        video_url,
+                        video_logger,
+                    )
+                )
+
+                if transcript is None:
+
+                    st.error(
+                        "❌ Could not retrieve transcript."
+                    )
+
+                else:
+
+                    transcript_length = (
+                        len(transcript)
+                    )
+
+                    st.session_state[
+                        "transcript_length"
+                    ] = transcript_length
+
+                    st.session_state[
+                        "video_id"
+                    ] = video_id
+
+                    log(
+                        "info",
+                        (
+                            "Transcript ready. "
+                            f"Characters={transcript_length:,}"
+                        ),
+                    )
+
+                    # ---------------------------------
+                    # RAG
+                    # ---------------------------------
+
+                    vector_store = (
+                        create_vector_store(
+                            transcript_text=transcript,
+                            video_id=video_id,
+                            video_logger=video_logger,
                         )
                     )
 
-                    # Store in session
                     st.session_state[
-                        "qa_chain"
-                    ] = qa_chain
+                        "vector_store"
+                    ] = vector_store
 
                     st.session_state[
                         "video_processed"
                     ] = True
 
                     st.session_state[
-                        "transcript_length"
-                    ] = len(
-                        transcript_text
-                    )
-
-                    log_message(
-                        "info",
-                        "QA chain stored in Streamlit session."
-                    )
-
-                    log_message(
-                        "info",
-                        "VIDEO PROCESSING COMPLETED SUCCESSFULLY."
+                        "processing_directory"
+                    ] = str(
+                        RAG_ROOT /
+                        video_id
                     )
 
                     st.success(
-                        "✅ Transcript processed successfully. "
-                        "You can now ask questions."
+                        "✅ Video processed successfully."
                     )
-
-                    # -------------------------------------------------
-                    # Transcript information
-                    # -------------------------------------------------
 
                     st.info(
-                        f"Transcript size: "
-                        f"{len(transcript_text):,} characters"
+                        (
+                            f"Transcript: "
+                            f"{transcript_length:,} characters\n\n"
+                            f"RAG data: "
+                            f"`rag_data/{video_id}/`"
+                        )
                     )
 
-                else:
-
-                    log_message(
-                        "error",
-                        "Transcript retrieval returned None."
+                    video_logger.info(
+                        "VIDEO PROCESSING COMPLETED SUCCESSFULLY"
                     )
 
-                    st.error(
-                        "❌ Failed to retrieve transcript."
+                    log(
+                        "info",
+                        (
+                            "VIDEO PROCESSING COMPLETED "
+                            "SUCCESSFULLY."
+                        ),
                     )
 
             except Exception as error:
 
                 log_exception(
-                    f"Fatal error during video processing: {error}"
+                    (
+                        "Video processing failed: "
+                        f"{error}"
+                    )
                 )
 
                 st.error(
@@ -1353,110 +2244,240 @@ if st.button(
 
 
 # =========================================================
-# QUESTION ANSWERING
+# QUESTIONS
 # =========================================================
 
-if "qa_chain" in st.session_state:
+if (
+    "vector_store"
+    in st.session_state
+):
 
     st.divider()
 
     st.subheader(
-        "💬 Ask a Question"
+        "💬 Ask About the Video"
     )
 
-    user_question = st.text_input(
-        "Ask a question about the transcript:",
+    question = st.text_input(
+        "Your question",
         placeholder=(
-            "What is this video about?"
+            "What is LangSmith?"
         ),
     )
 
-    if user_question.strip():
+    if question.strip():
 
-        log_message(
-            "info",
-            f"User question received: {user_question}"
+        video_id = st.session_state.get(
+            "video_id"
         )
 
-        with st.spinner(
-            "Generating answer..."
-        ):
+        if not video_id:
 
-            try:
+            st.error(
+                "Video ID is missing from session."
+            )
 
-                # -------------------------------------------------
-                # Invoke RetrievalQA
-                # -------------------------------------------------
+        else:
 
-                log_message(
-                    "info",
-                    "Sending question to RetrievalQA..."
+            log(
+                "info",
+                f"User question: {question}",
+            )
+
+            video_logger = (
+                create_video_logger(
+                    video_id
                 )
+            )
 
-                answer = (
-                    st.session_state[
-                        "qa_chain"
-                    ].invoke(
-                        {
-                            "query": user_question
-                        }
-                    )
+            with st.spinner(
+                (
+                    "Searching transcript "
+                    "and generating answer..."
                 )
+            ):
 
-                log_message(
-                    "info",
-                    "RetrievalQA returned successfully."
-                )
+                try:
 
-                # -------------------------------------------------
-                # Extract answer
-                # -------------------------------------------------
+                    # ---------------------------------
+                    # Retrieval
+                    # ---------------------------------
 
-                result = answer.get(
-                    "result",
-                    "",
-                )
-
-                if not result:
-
-                    log_message(
-                        "warning",
-                        "QA response did not contain a 'result' field."
+                    (
+                        context,
+                        retrieved_metadata,
+                    ) = retrieve_context(
+                        st.session_state[
+                            "vector_store"
+                        ],
+                        question,
                     )
 
-                    st.warning(
-                        "The model returned an empty answer."
+                    video_logger.info(
+                        (
+                            "QUESTION | "
+                            f"{question}"
+                        )
                     )
 
-                else:
-
-                    log_message(
-                        "info",
-                        f"Generated answer length: {len(result)} characters."
+                    video_logger.info(
+                        (
+                            "RETRIEVAL | "
+                            f"chunks={len(retrieved_metadata)} | "
+                            f"context_chars={len(context)}"
+                        )
                     )
 
-                    log_message(
-                        "debug",
-                        f"Generated answer: {result}"
+                    # ---------------------------------
+                    # Gemini
+                    # ---------------------------------
+
+                    answer = ask_gemini(
+                        video_id=video_id,
+                        question=question,
+                        context=context,
+                        retrieved_metadata=(
+                            retrieved_metadata
+                        ),
                     )
+
+                    # ---------------------------------
+                    # Display answer
+                    # ---------------------------------
 
                     st.subheader(
                         "🤖 Answer"
                     )
 
                     st.write(
-                        result
+                        answer
                     )
 
-            except Exception as error:
+                    # ---------------------------------
+                    # Retrieved context
+                    # ---------------------------------
 
-                log_exception(
-                    f"Failed to generate answer: {error}"
-                )
+                    with st.expander(
+                        "🔎 View Retrieved Transcript Context"
+                    ):
 
-                st.error(
-                    f"❌ Failed to generate answer: {error}"
-                )
+                        st.text(
+                            context
+                        )
+
+                    # ---------------------------------
+                    # Token info
+                    # ---------------------------------
+
+                    usage_path = (
+                        RAG_ROOT /
+                        video_id /
+                        TOKEN_USAGE_FILENAME
+                    )
+
+                    if usage_path.exists():
+
+                        try:
+
+                            with open(
+                                usage_path,
+                                "r",
+                                encoding="utf-8",
+                            ) as file:
+
+                                usage_records = (
+                                    json.load(file)
+                                )
+
+                            if usage_records:
+
+                                latest_usage = (
+                                    usage_records[-1]
+                                )
+
+                                gemini_usage = (
+                                    latest_usage.get(
+                                        "gemini",
+                                        {}
+                                    )
+                                )
+
+                                with st.expander(
+                                    "📊 Token / Usage Information"
+                                ):
+
+                                    col1, col2, col3 = (
+                                        st.columns(3)
+                                    )
+
+                                    with col1:
+
+                                        st.metric(
+                                            "Input Tokens",
+                                            str(
+                                                gemini_usage.get(
+                                                    "prompt_tokens"
+                                                )
+                                                or
+                                                gemini_usage.get(
+                                                    "count_tokens_result"
+                                                )
+                                                or
+                                                "N/A"
+                                            ),
+                                        )
+
+                                    with col2:
+
+                                        st.metric(
+                                            "Output Tokens",
+                                            str(
+                                                gemini_usage.get(
+                                                    "output_tokens"
+                                                )
+                                                or
+                                                "N/A"
+                                            ),
+                                        )
+
+                                    with col3:
+
+                                        st.metric(
+                                            "Total Tokens",
+                                            str(
+                                                gemini_usage.get(
+                                                    "total_tokens"
+                                                )
+                                                or
+                                                "N/A"
+                                            ),
+                                        )
+
+                        except Exception as error:
+
+                            log(
+                                "warning",
+                                (
+                                    "Could not display "
+                                    f"token usage: {error}"
+                                ),
+                            )
+
+                except Exception as error:
+
+                    log_exception(
+                        (
+                            "Failed to generate answer: "
+                            f"{error}"
+                        )
+                    )
+
+                    st.error(
+                        (
+                            "❌ Failed to generate answer: "
+                            f"{error}"
+                        )
+                    )
 
 
 # =========================================================
@@ -1466,7 +2487,7 @@ if "qa_chain" in st.session_state:
 st.divider()
 
 st.subheader(
-    "🧾 Application Logs"
+    "🧾 Detailed Logs"
 )
 
 if st.session_state["logs"]:
@@ -1486,21 +2507,59 @@ if st.session_state["logs"]:
 else:
 
     st.caption(
-        "No logs generated yet."
+        "No logs yet."
     )
 
 
 # =========================================================
-# LOG FILE INFORMATION
+# CURRENT RAG DIRECTORY
 # =========================================================
 
-if os.path.exists(LOG_FILE):
+if "processing_directory" in st.session_state:
 
-    file_size = os.path.getsize(
-        LOG_FILE
+    st.divider()
+
+    st.subheader(
+        "📁 Generated RAG Data"
     )
 
-    st.caption(
-        f"Full log file: `{os.path.abspath(LOG_FILE)}` "
-        f"({file_size:,} bytes)"
+    directory = Path(
+        st.session_state[
+            "processing_directory"
+        ]
     )
+
+    st.code(
+        str(
+            directory.resolve()
+        ),
+        language="text",
+    )
+
+    if directory.exists():
+
+        files = []
+
+        for file in sorted(
+            directory.iterdir()
+        ):
+
+            if file.is_file():
+
+                size_mb = (
+                    file.stat().st_size
+                    / (1024 * 1024)
+                )
+
+                files.append(
+                    (
+                        file.name,
+                        f"{size_mb:.2f} MB"
+                    )
+                )
+
+        for filename, size in files:
+
+            st.write(
+                f"**{filename}** — {size}"
+            )

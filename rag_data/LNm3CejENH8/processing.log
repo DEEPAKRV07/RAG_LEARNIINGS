@@ -1,0 +1,11 @@
+2026-08-26 15:56:27 | INFO | Processing video: LNm3CejENH8
+2026-08-26 15:56:27 | INFO | STARTING TRANSCRIPT RETRIEVAL
+2026-08-26 15:56:31 | INFO | STARTING RAG PIPELINE
+2026-08-26 15:56:51 | INFO | RAG COMPLETE | transcript_chars=153388 | chunks=162 | embeddings=162 | dimension=384
+2026-08-26 15:56:51 | INFO | VIDEO PROCESSING COMPLETED SUCCESSFULLY
+2026-08-26 15:58:30 | INFO | QUESTION | langgraph endral enna?
+2026-08-26 15:58:30 | INFO | RETRIEVAL | chunks=6 | context_chars=2994
+2026-08-26 15:58:57 | INFO | QUESTION | langgraph endral enna?answer in tamil
+2026-08-26 15:58:57 | INFO | RETRIEVAL | chunks=6 | context_chars=2723
+2026-08-26 16:01:14 | INFO | QUESTION | explain the whole video in tamil
+2026-08-26 16:01:14 | INFO | RETRIEVAL | chunks=6 | context_chars=3164

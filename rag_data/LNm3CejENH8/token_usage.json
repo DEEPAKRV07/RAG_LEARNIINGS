@@ -1,0 +1,155 @@
+[
+  {
+    "timestamp": "2026-08-26T15:58:42.066647",
+    "model": "gemini-3.6-flash",
+    "question": "langgraph endral enna?",
+    "question_characters": 22,
+    "retrieved_context": {
+      "characters": 2994,
+      "words": 425,
+      "chunks": [
+        {
+          "rank": 1,
+          "characters": 168,
+          "words": 23
+        },
+        {
+          "rank": 2,
+          "characters": 455,
+          "words": 56
+        },
+        {
+          "rank": 3,
+          "characters": 698,
+          "words": 98
+        },
+        {
+          "rank": 4,
+          "characters": 600,
+          "words": 84
+        },
+        {
+          "rank": 5,
+          "characters": 257,
+          "words": 38
+        },
+        {
+          "rank": 6,
+          "characters": 657,
+          "words": 96
+        }
+      ]
+    },
+    "gemini": {
+      "count_tokens_result": 1163,
+      "prompt_tokens": 1163,
+      "output_tokens": 95,
+      "total_tokens": 1967
+    },
+    "answer": {
+      "characters": 400
+    }
+  },
+  {
+    "timestamp": "2026-08-26T15:59:09.298598",
+    "model": "gemini-3.6-flash",
+    "question": "langgraph endral enna?answer in tamil",
+    "question_characters": 37,
+    "retrieved_context": {
+      "characters": 2723,
+      "words": 382,
+      "chunks": [
+        {
+          "rank": 1,
+          "characters": 168,
+          "words": 23
+        },
+        {
+          "rank": 2,
+          "characters": 455,
+          "words": 56
+        },
+        {
+          "rank": 3,
+          "characters": 257,
+          "words": 38
+        },
+        {
+          "rank": 4,
+          "characters": 398,
+          "words": 57
+        },
+        {
+          "rank": 5,
+          "characters": 698,
+          "words": 98
+        },
+        {
+          "rank": 6,
+          "characters": 588,
+          "words": 80
+        }
+      ]
+    },
+    "gemini": {
+      "count_tokens_result": 1071,
+      "prompt_tokens": 1071,
+      "output_tokens": 164,
+      "total_tokens": 2084
+    },
+    "answer": {
+      "characters": 569
+    }
+  },
+  {
+    "timestamp": "2026-08-26T16:01:27.445366",
+    "model": "gemini-3.6-flash",
+    "question": "explain the whole video in tamil",
+    "question_characters": 32,
+    "retrieved_context": {
+      "characters": 3164,
+      "words": 425,
+      "chunks": [
+        {
+          "rank": 1,
+          "characters": 168,
+          "words": 23
+        },
+        {
+          "rank": 2,
+          "characters": 455,
+          "words": 56
+        },
+        {
+          "rank": 3,
+          "characters": 588,
+          "words": 80
+        },
+        {
+          "rank": 4,
+          "characters": 398,
+          "words": 57
+        },
+        {
+          "rank": 5,
+          "characters": 257,
+          "words": 38
+        },
+        {
+          "rank": 6,
+          "characters": 1139,
+          "words": 141
+        }
+      ]
+    },
+    "gemini": {
+      "count_tokens_result": 1207,
+      "prompt_tokens": 1207,
+      "output_tokens": 509,
+      "total_tokens": 2647
+    },
+    "answer": {
+      "characters": 1706
+    }
+  }
+]
